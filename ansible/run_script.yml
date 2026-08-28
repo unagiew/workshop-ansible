@@ -1,0 +1,13 @@
+---
+- name: Sample script to run local shell on remote hosts
+  hosts: all
+  gather_facts: false
+
+  tasks:
+    - name: Execute shell on remote hosts
+      ansible.builtin.script: ./scripts/hostname.sh
+      register: result
+
+    - name: Show result
+      ansible.builtin.debug:
+        var: result.stdout_lines

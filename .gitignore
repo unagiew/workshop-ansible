@@ -1,0 +1,40 @@
+# Prepared for when this repository is placed under git version control.
+# This file has no effect until the user runs `git init` in the repo root.
+
+# Terraform state (may contain sensitive data)
+*.tfstate
+*.tfstate.backup
+
+# Local Terraform working directory (provider plugins, plan cache, etc.)
+.terraform/
+
+# User-specific variable values (contains real local paths); use
+# terraform.tfvars.example as the shareable template instead.
+terraform.tfvars
+
+# Crash log files
+crash.log
+
+# CLAUDE CODE
+CLAUDE.md
+.claude/
+
+# Jetbrains
+.idea/
+
+# VSCode
+.vscode/
+.crossnote/
+
+# macOS
+.DS_Store
+
+# ansible
+.ansible/
+*.retry
+
+# python
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
