@@ -1,0 +1,13 @@
+# Example variable values for this Terraform configuration.
+#
+# Copy this file to `terraform.tfvars` and adjust the paths below to match
+# your local environment. `terraform.tfvars` contains user-specific paths and
+# must not be committed to version control (see terraform/.gitignore).
+
+nodes = {
+    "ubuntu1" = { cpus = 2, memory = "4G", disk = "20G" }
+    "ubuntu2" = { cpus = 2, memory = "4G", disk = "20G" }
+}
+
+ssh_public_key_path = "~/.ssh/ansible/id_ed25519.pub"
+ssh_private_key_path = "~/.ssh/ansible/id_ed25519"

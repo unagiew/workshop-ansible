@@ -1,0 +1,11 @@
+---
+- name: Sample template to render per-host values
+  hosts: all
+  gather_facts: false
+
+  tasks:
+    - name: Deploy MOTD from template
+      ansible.builtin.template:
+        src: templates/motd.j2
+        dest: /tmp/motd.txt
+        mode: "0644"
