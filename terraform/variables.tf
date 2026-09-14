@@ -25,13 +25,11 @@ variable "nodes" {
 variable "ssh_public_key_path" {
   description = "SSH public key for Ansible connection"
   type        = string
-  default = "value"
 }
 
 variable "ssh_private_key_path" {
   description = "SSH private key for Ansible connection"
   type        = string
-  default = "value"
 }
 
 variable "vm_image" {
