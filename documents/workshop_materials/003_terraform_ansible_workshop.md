@@ -20,6 +20,8 @@
     ├── main.tf
     ├── terraform.tfvars
     ├── terraform.tfvars.example
+    ├── tests
+    │   └── host_keys.tftest.hcl
     └── variables.tf
 ```
 
@@ -32,7 +34,10 @@
 | `terraform/terraform.tfvars` | 環境固有の変数値（VM構成やSSH鍵パスなど） |
 | `terraform/terraform.tfvars.example` | `terraform.tfvars`作成時のひな形 |
 | `terraform/inventory.ini.tpl` | Ansible inventory生成用テンプレート |
+| `terraform/tests/host_keys.tftest.hcl` | `terraform test`用のテスト（7.6参照、VMは作成しない） |
+| `terraform/.host_keys/<VM名>.ed25519.pub` | 各VMからダウンロードしたSSHホスト公開鍵（`terraform apply`時に自動生成、Git管理対象外） |
 | `ansible/inventory.ini` | Ansibleの接続先（`terraform apply`時に自動生成） |
+| `ansible/known_hosts` | AnsibleのSSHホスト鍵確認用ファイル（`terraform apply`時に自動生成、Git管理対象外、7.6参照） |
 | `ansible/run_script.yml` | Ansibleの処理内容（15章） |
 | `ansible/run_template.yml` | `template` moduleのサンプル処理内容（15.5章） |
 | `ansible/scripts/hostname.sh` | MacからVMへ転送して実行するShell |
@@ -86,6 +91,11 @@ terraform {
     multipass = {
       source  = "todoroff/multipass"
       version = "~> 1.7"
+    }
+
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.5"
     }
   }
 }
@@ -154,17 +164,75 @@ resource "multipass_instance" "node" {
   # YAML body, not the leading marker cloud-init requires.
   cloud_init = "#cloud-config\n${yamlencode(local.cloud_init_config)}"
 
+  # Block until cloud-init has finished so that the SSH host keys (read by
+  # multipass_file_download.host_key below) and python3 (needed by Ansible)
+  # exist before any downstream resource runs.
+  wait_for_cloud_init = true
+
   lifecycle {
     precondition {
       # Validates that the file at var.ssh_public_key_path actually contains
       # an OpenSSH public key, since yamlencode() only guarantees
       # syntactically valid YAML, not syntactically valid key content (e.g. a
-      # typo'd path pointing at a private key or an empty file). A lifecycle
-      # precondition hard-fails plan/apply, which is required here since a
-      # passing apply with an empty ssh_authorized_keys entry would silently
-      # create an unreachable VM.
+      # typo'd path pointing at a private key or an empty file). Unlike a
+      # `check` block (advisory-only: prints a warning but lets plan/apply
+      # succeed), a lifecycle precondition hard-fails plan/apply, which is
+      # required here since a passing apply with an empty
+      # ssh_authorized_keys entry would silently create an unreachable VM.
       condition     = local.ssh_public_key_match != null
       error_message = "The SSH public key at var.ssh_public_key_path (\"${var.ssh_public_key_path}\") does not look like a valid OpenSSH public key. Expected format: \"<type> <base64> [comment]\", e.g. \"ssh-ed25519 AAAA... user@host\". Check that the path points at a public key file (not a private key) and that it is not empty or corrupted."
+    }
+  }
+}
+
+# Fetch each VM's SSH host *public* key through Multipass (`multipass
+# transfer`). This channel goes through the local multipassd daemon, not SSH,
+# so it cannot be intercepted by an SSH man-in-the-middle. The host private
+# key never leaves the VM and is never stored in Terraform state.
+resource "multipass_file_download" "host_key" {
+  for_each = multipass_instance.node
+
+  instance       = each.value.name
+  source         = "/etc/ssh/ssh_host_ed25519_key.pub"
+  destination    = "${path.module}/.host_keys/${each.key}.ed25519.pub"
+  create_parents = true
+  overwrite      = true
+
+  lifecycle {
+    # A replaced VM has a new host key, so download it again.
+    replace_triggered_by = [multipass_instance.node[each.key]]
+  }
+}
+
+data "local_file" "host_key" {
+  for_each = multipass_file_download.host_key
+
+  filename = each.value.destination
+}
+
+locals {
+  # "<type> <base64>" per node, with the "root@<host>" comment dropped. null
+  # marks a file that does not look like an OpenSSH public key; the
+  # precondition on local_file.ansible_known_hosts reports it.
+  host_public_keys = {
+    for name, key_file in data.local_file.host_key :
+    name => try(join(" ", regex(local.ssh_public_key_regex, trimspace(key_file.content))), null)
+  }
+}
+
+resource "local_file" "ansible_known_hosts" {
+  filename        = "${path.module}/${var.ansible_known_hosts_path}"
+  file_permission = "0644"
+
+  content = join("", [
+    for name, node in multipass_instance.node :
+    "${node.ipv4[0]} ${local.host_public_keys[name]}\n"
+  ])
+
+  lifecycle {
+    precondition {
+      condition     = alltrue([for key in values(local.host_public_keys) : key != null])
+      error_message = "One or more SSH host public keys downloaded to terraform/.host_keys/ are not valid OpenSSH public keys. Re-download them with: terraform apply -replace='multipass_file_download.host_key[\"<node>\"]'"
     }
   }
 }
@@ -181,6 +249,10 @@ resource "local_file" "ansible_inventory" {
       }
 
       ssh_private_key_path = var.ssh_private_key_path
+
+      # Absolute, because OpenSSH resolves UserKnownHostsFile relative to the
+      # directory ansible is run from.
+      known_hosts_path = abspath(local_file.ansible_known_hosts.filename)
     }
   )
 }
@@ -205,6 +277,8 @@ main.tfの各ブロックの役割は次のとおりである。
 ### `terraform`ブロック
 
 使用するTerraformのバージョンと、Multipassを操作するためのプロバイダ（`todoroff/multipass`）を指定する。プロバイダを介して、TerraformからMultipassのVM作成・削除を行えるようになる。
+
+`hashicorp/local`は、ローカルファイル（`ansible/known_hosts`や`ansible/inventory.ini`）を読み書きするための公式プロバイダである。SSHホスト鍵のPinning（7.6）で使用する。
 
 ### `locals`ブロック
 
@@ -240,15 +314,25 @@ VM本体を作成するリソースである。
   | `each.value` | CPU、メモリ、ディスクなどの設定 |
 - `image` / `cpus` / `memory` / `disk` は、それぞれ`var.vm_image`と`each.value`の各項目をVM作成時のスペックとして渡す。
 - `cloud_init` は、`local.cloud_init_config`（HCLのマップ）を`yamlencode()`関数でYAML文字列に変換し、先頭に`#cloud-config`というマーカーを付与した内容をVMの初期設定として渡す（詳細は8.2）。`yamlencode()`を使うことで、`local.ssh_public_key`にYAMLの特殊文字（コロンや`*`、`&`など）が含まれていた場合でも、常に構文的に正しいYAMLが生成される。
+- `wait_for_cloud_init = true` は、cloud-initの完了を待ってから`terraform apply`を先へ進める設定である。これにより、次で説明する`multipass_file_download.host_key`がSSHホスト鍵を読みに行く時点で、VM側のcloud-init（SSHホスト鍵生成・`python3`インストールなど）が確実に終わっている状態になる。
 - `lifecycle`ブロックの`precondition`は、`local.ssh_public_key_match`が`null`（＝`var.ssh_public_key_path`の内容がOpenSSHの公開鍵として不正）の場合に、`terraform plan` / `apply`をエラーで停止させる。これにより、SSH公開鍵が正しく読み込めていない状態のままVMが作成され、Ansibleから接続できない状態になることを防ぐ。
+
+### `resource "multipass_file_download" "host_key"` 〜 `resource "local_file" "ansible_known_hosts"`
+
+SSHホスト鍵のPinningに関わる一連のリソースである。詳細な理由は7.6でまとめて説明するが、main.tf上の役割は次のとおりである。
+
+- `multipass_file_download.host_key` は、各VM（`multipass_instance.node`）の`/etc/ssh/ssh_host_ed25519_key.pub`（SSHホスト**公開**鍵）を、`multipass transfer`相当の仕組みで`terraform/.host_keys/<VM名>.ed25519.pub`にダウンロードする。`lifecycle.replace_triggered_by`により、VMが再作成された場合は鍵を再ダウンロードする。
+- `data.local_file.host_key` は、ダウンロードした鍵ファイルの内容を読み込む。
+- 2番目の`locals`ブロックの`host_public_keys`は、読み込んだ内容から正規表現（`local.ssh_public_key_regex`）で`"<鍵種別> <base64>"`部分だけを取り出す。ファイルがOpenSSHの公開鍵として解析できない場合は`null`になる。
+- `local_file.ansible_known_hosts` は、各VMのIPアドレスと`local.host_public_keys`を`"<IP> <鍵種別> <base64>"`という形式で1行ずつ結合し、`var.ansible_known_hosts_path`（デフォルト`../ansible/known_hosts`）に書き出す。`lifecycle.precondition`は、`host_public_keys`のいずれかが`null`（＝鍵ファイルが不正）だった場合に、再ダウンロード方法を示すエラーメッセージとともに`apply`を停止させる。
 
 ### `resource "local_file" "ansible_inventory"`
 
 Ansibleが使用するinventoryファイルをローカルに生成するリソースである。
 
 - `filename` は、`var.ansible_inventory_path`（デフォルト`../ansible/inventory.ini`）で指定した出力先パスになる。
-- `content` は、`inventory.ini.tpl`（7.5）をテンプレートとして、`multipass_instance.node`から取得した各VMの名前とIPアドレス（`nodes`）、および`var.ssh_private_key_path`（`ssh_private_key_path`）を埋め込んだ内容になる。
-- `multipass_instance.node`の作成が終わり、各VMのIPアドレスが確定したあとにこのリソースが実行されるため、`terraform apply`一回でVM作成とinventory生成が完結する。
+- `content` は、`inventory.ini.tpl`（7.5）をテンプレートとして、`multipass_instance.node`から取得した各VMの名前とIPアドレス（`nodes`）、`var.ssh_private_key_path`（`ssh_private_key_path`）、および`local_file.ansible_known_hosts`の絶対パス（`known_hosts_path`）を埋め込んだ内容になる。絶対パスにしているのは、OpenSSHが`UserKnownHostsFile`をAnsible実行時のカレントディレクトリ（`ansible/`）基準で解決するためである。
+- `multipass_instance.node`の作成が終わり、各VMのIPアドレスが確定し、`local_file.ansible_known_hosts`が生成されたあとにこのリソースが実行されるため、`terraform apply`一回でVM作成・known_hosts生成・inventory生成が完結する。
 
 ### `output`ブロック
 
@@ -301,6 +385,12 @@ variable "ansible_inventory_path" {
   type        = string
   default     = "../ansible/inventory.ini"
 }
+
+variable "ansible_known_hosts_path" {
+  description = "Output path for the generated SSH known_hosts file used by Ansible"
+  type        = string
+  default     = "../ansible/known_hosts"
+}
 ```
 
 | 変数名 | 役割 | デフォルト値 |
@@ -310,6 +400,7 @@ variable "ansible_inventory_path" {
 | `ssh_private_key_path` | AnsibleがSSH接続に使う秘密鍵のパス | なし（`terraform.tfvars`で指定必須） |
 | `vm_image` | 使用するMultipassイメージ | `24.04` |
 | `ansible_inventory_path` | 生成するinventoryファイルの出力先 | `../ansible/inventory.ini` |
+| `ansible_known_hosts_path` | 生成するknown_hostsファイルの出力先（7.6参照） | `../ansible/known_hosts` |
 
 ## 7.4 terraform.tfvars
 
@@ -334,7 +425,7 @@ ssh_private_key_path = "~/.ssh/ansible/id_ed25519"
 
 ## 7.5 inventory.ini.tpl
 
-`local_file.ansible_inventory`が使用するテンプレートである。VM作成後のIPアドレスと、`ssh_private_key_path`（7.3参照）を埋め込み、Ansibleが接続時に使用するinventoryファイルを生成する。
+`local_file.ansible_inventory`が使用するテンプレートである。VM作成後のIPアドレスと、`ssh_private_key_path` / `known_hosts_path`（7.3参照）を埋め込み、Ansibleが接続時に使用するinventoryファイルを生成する。
 
 ```text
 [ubuntu]
@@ -346,11 +437,63 @@ ${name} ansible_host=${ip}
 ansible_user=ansible
 ansible_ssh_private_key_file=${ssh_private_key_path}
 ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_common_args='-o StrictHostKeyChecking=yes -o UserKnownHostsFile="${known_hosts_path}"'
 ```
 
-`ansible_ssh_private_key_file`に`ssh_private_key_path`の値が展開されるため、9.6で生成される実際の`inventory.ini`には`[ubuntu:vars]`セクションとしてSSH秘密鍵のパスが含まれる。
+`ansible_ssh_private_key_file`に`ssh_private_key_path`の値が展開されるため、9.4で生成される実際の`inventory.ini`には`[ubuntu:vars]`セクションとしてSSH秘密鍵のパスが含まれる。
 
-## 7.6 terraform.tfstate
+`ansible_ssh_common_args`は、Ansibleが内部で実行するSSHコマンドに常に付与される追加オプションである。ここでは`-o StrictHostKeyChecking=yes -o UserKnownHostsFile="<known_hostsの絶対パス>"`を渡し、7.6で生成される`ansible/known_hosts`だけをホスト鍵の検証対象にする。これにより、初回接続時のプロンプトが出ず、`~/.ssh/known_hosts`にも一切書き込まれない。
+
+## 7.6 SSHホスト鍵のPinning（`ansible/known_hosts`）
+
+### 7.6.1 課題
+
+各VMは、cloud-initの初回起動時にSSHホスト鍵をランダムに生成する。7.5の`ansible_ssh_common_args`を追加する前は、OpenSSHが`~/.ssh/known_hosts`を使う既定の挙動（`StrictHostKeyChecking=ask`）に依存していたため、次のような問題があった。
+
+- 初回のAnsible実行時に`Are you sure you want to continue connecting (yes/no/[fingerprint])?`という確認プロンプトが表示される。複数ホストへ並列接続すると、このプロンプトが競合して失敗・ハングすることがある。
+- `terraform destroy` → `apply`でVMを作り直すと、MultipassがIPを再利用しつつ新しいホスト鍵を生成することが多く、`REMOTE HOST IDENTIFICATION HAS CHANGED`エラーになる。手元の`~/.ssh/known_hosts`を人手で編集しないと復旧できない。
+
+### 7.6.2 対応方針
+
+`StrictHostKeyChecking=no`のように検証そのものを無効化するのは簡単だが、ホスト認証を無意味にしてしまうため採用しない。また、SSHホスト鍵をTerraform側（`tls_private_key`）で生成してcloud-init経由でVMへ注入する方法も検討したが、秘密鍵が`terraform.tfstate`とcloud-initのuser-dataに平文で残ってしまう（tfstateをリモートBackendに置く場合や、クラウド環境でuser-dataがメタデータサービス経由で読める場合に問題になる）ため採用しなかった。
+
+代わりに、次の方針を採った。
+
+- SSHホスト鍵はこれまでと同様、各VM内部で生成させる。**秘密鍵はVMの外へ一切出さない。**
+- Terraformは、VMのSSHホスト**公開**鍵だけを、Multipassのファイル転送機能（`multipass transfer`相当、`multipass_file_download`リソース）経由で取得する。この経路はSSHではなくローカルの`multipassd`デーモンを介するため、SSH越しのMITM（中間者攻撃）の影響を受けない。
+- 取得した公開鍵から`ansible/known_hosts`を生成し、Ansibleにはそのファイルだけをホスト鍵検証の対象として使わせる（7.5の`ansible_ssh_common_args`）。
+
+### 7.6.3 処理の流れ
+
+```mermaid
+flowchart TD
+  A["multipass_instance.node<br/>wait_for_cloud_init = true"]
+  B["multipass_file_download.host_key<br/>（multipassd経由でVMから公開鍵を取得）"]
+  C["terraform/.host_keys/&lt;VM名&gt;.ed25519.pub"]
+  D["data.local_file.host_key"]
+  E["local.host_public_keys<br/>（&quot;&lt;鍵種別&gt; &lt;base64&gt;&quot;を抽出）"]
+  F["local_file.ansible_known_hosts<br/>ansible/known_hosts"]
+  G["local_file.ansible_inventory<br/>ansible_ssh_common_args"]
+
+  A --> B --> C --> D --> E --> F --> G
+```
+
+main.tf上の各リソースの詳細は7.2を参照。
+
+### 7.6.4 クラウド環境への応用
+
+この「信頼できるアウトオブバンドな経路で公開鍵を取得する」というパターンは、Multipass以外の環境にもそのまま応用できる。例えば、AWSであればコンソール出力（EC2 console output）、GCPであればGuest Attributesなど、クラウドプロバイダが提供する認証済みAPIから同様にホスト公開鍵を取得できる。
+
+### 7.6.5 自動テスト（`terraform test`）
+
+`terraform/tests/host_keys.tftest.hcl`には、上記の一連の変換ロジック（ダウンロードした鍵の解析・`known_hosts`の内容・inventoryの`ansible_ssh_common_args`・不正な鍵に対するエラー）を検証する`terraform test`が用意されている。`multipass`・`local`プロバイダを`mock_provider`でモックしているため、実際のVM作成やファイル書き込みは発生しない。
+
+```bash
+cd terraform
+terraform test
+```
+
+## 7.7 terraform.tfstate
 
 Terraformは、設定ファイル（`*.tf`）だけでなく`terraform.tfstate`という状態ファイルを使って、自分が管理しているリソースの現在の状態を把握している。
 
@@ -488,6 +631,7 @@ $ terraform init  # Terraform初期化
 
 Initializing provider plugins found in the configuration...
 - Finding todoroff/multipass versions matching "~> 1.7"...
+- Finding hashicorp/local versions matching "~> 2.5"...
 (略)
 
 $ terraform plan  # 実行計画を確認
@@ -515,13 +659,19 @@ Do you want to perform these actions?
 
 multipass_instance.node["ubuntu2"]: Creating...
 multipass_instance.node["ubuntu1"]: Creating...
-(略)
+(略、cloud-initの完了待ちのため数十秒かかる)
 multipass_instance.node["ubuntu2"]: Creation complete after 46s [id=ubuntu2]
 multipass_instance.node["ubuntu1"]: Creation complete after 47s [id=ubuntu1]
+multipass_file_download.host_key["ubuntu1"]: Creating...
+multipass_file_download.host_key["ubuntu2"]: Creating...
+multipass_file_download.host_key["ubuntu1"]: Creation complete after 1s
+multipass_file_download.host_key["ubuntu2"]: Creation complete after 1s
+local_file.ansible_known_hosts: Creating...
+local_file.ansible_known_hosts: Creation complete after 0s [id=...]
 local_file.ansible_inventory: Creating...
 local_file.ansible_inventory: Creation complete after 0s [id=6eb48d3dbba0c534c6ed9323bd6324815e507baa]
 
-Apply complete! Resources: 3 added, 0 changed, 0 destroyed.
+Apply complete! Resources: 6 added, 0 changed, 0 destroyed.
 
 Outputs:
 
@@ -573,9 +723,10 @@ ubuntu2 ansible_host=192.168.64.xx
 ansible_user=ansible
 ansible_ssh_private_key_file=~/.ssh/ansible/id_ed25519
 ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_common_args='-o StrictHostKeyChecking=yes -o UserKnownHostsFile="/path/to/repo/ansible/known_hosts"'
 ```
 
-これでAnsibleが接続する対象が決まる。
+これでAnsibleが接続する対象が決まる。`ansible_ssh_common_args`の`UserKnownHostsFile`には、7.6で生成される`ansible/known_hosts`の絶対パスが入る（7.5参照）。
 
 ## 9.5 VMの削除（terraform destroy）
 
@@ -619,7 +770,15 @@ ssh -i ~/.ssh/ansible/id_ed25519 ansible@<VMのIPアドレス>
 ssh -i ~/.ssh/ansible/id_ed25519 ansible@192.168.64.10
 ```
 
-である。初回接続時はSSHのホスト鍵確認プロンプト（`Are you sure you want to continue connecting (yes/no/[fingerprint])?`）が表示されることがあるが、その場合は`yes`と入力する。
+である。
+
+7.6で説明したとおり、`terraform apply`が`ansible/known_hosts`にVMのSSHホスト公開鍵をあらかじめ書き込んでいるため、素の`ssh`コマンドでは初回接続時にこのファイルが使われず、SSHのホスト鍵確認プロンプト（`Are you sure you want to continue connecting (yes/no/[fingerprint])?`）が表示される。動作確認だけであれば`yes`と入力してよいが、Ansibleと同じ`known_hosts`を使って確認したい場合は、`-o UserKnownHostsFile`で明示的に指定する。
+
+```bash
+ssh -i ~/.ssh/ansible/id_ed25519 -o UserKnownHostsFile=../ansible/known_hosts ansible@<VMのIPアドレス>
+```
+
+（`cd terraform`した状態、つまり9.1の直後を想定したパス。`ansible/`ディレクトリから実行する場合は`known_hosts`のみでよい。）この場合、`ansible/known_hosts`に登録された鍵と一致する限りプロンプトは表示されず、一致しない場合は`Host key verification failed`で接続が拒否される。
 
 SSH接続できない場合、Ansibleを調査する前に、
 
@@ -717,6 +876,36 @@ hostname
 
 - VMが中途半端な状態で残った場合は、一度`multipass delete --purge`で該当VMを削除し、`terraform apply`を再実行する。
 - `terraform.tfstate`とMultipass側の実態がずれてしまった場合は、`terraform refresh`で状態を同期してから再実行する。
+
+## 10.4 VMが停止している状態で`terraform plan` / `destroy`が失敗する
+
+VMを`multipass stop`で停止した状態のまま`terraform plan`や`terraform destroy`を実行すると、次のようなエラーになることがある。
+
+```text
+Error: Attempt to index null value
+```
+
+これは、7.2の`multipass_instance.node[each.key].ipv4[0]`（`local_file.ansible_known_hosts` / `local_file.ansible_inventory`が参照する）が、VM停止中は`ipv4`が`null`になるために発生する既知の制約である。回避方法は次の2つである。
+
+- VMを起動してから`plan` / `destroy`を実行する。
+
+  ```bash
+  multipass start ubuntu1 ubuntu2
+  ```
+
+- 状態の再取得（refresh）自体を止めて実行する。
+
+  ```bash
+  terraform destroy -refresh=false
+  ```
+
+## 10.5 `terraform/.host_keys/*.pub`を誤って削除してしまった場合
+
+`terraform/.host_keys/<VM名>.ed25519.pub`（7.6参照）は`.gitignore`対象のキャッシュファイルである。誤って手動で削除すると、次回の`terraform plan`が`data.local_file.host_key`の読み込みに失敗する。この場合は、対象VMの`multipass_file_download.host_key`だけを対象に再作成（再ダウンロード）すればよい。
+
+```bash
+terraform apply -replace='multipass_file_download.host_key["ubuntu1"]'
+```
 
 ---
 

@@ -126,6 +126,7 @@ ubuntu2 ansible_host=192.168.64.11
 ansible_user=ansible
 ansible_ssh_private_key_file=~/.ssh/ansible/id_ed25519
 ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_common_args='-o StrictHostKeyChecking=yes -o UserKnownHostsFile="/path/to/repo/ansible/known_hosts"'
 ```
 
 ## 12.2 グループ
@@ -196,6 +197,7 @@ ubuntu2 ansible_host=192.168.64.11 role=db
 ansible_user=ansible
 ansible_ssh_private_key_file=~/.ssh/ansible/id_ed25519
 ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_common_args='-o StrictHostKeyChecking=yes -o UserKnownHostsFile="/path/to/repo/ansible/known_hosts"'
 ```
 
 `[ubuntu:vars]`は、`ubuntu`グループに所属する全ホストへ適用される変数を定義するセクションである。
@@ -203,6 +205,7 @@ ansible_python_interpreter=/usr/bin/python3
 - `ansible_user` はSSH接続時のログインユーザー（cloud-initで作成した`ansible`ユーザー）
 - `ansible_ssh_private_key_file` はSSH接続に使う秘密鍵のパス（4.2で作成したもの）
 - `ansible_python_interpreter` は対象VM上のPythonの場所
+- `ansible_ssh_common_args` は、Ansibleが内部で呼び出すSSHコマンドに付与する追加オプションである（003 7.6参照）。`StrictHostKeyChecking=yes`と、`terraform apply`時に生成される`ansible/known_hosts`への絶対パスを指定した`UserKnownHostsFile`により、SSHのホスト鍵確認をそのファイルだけに委ねる。これにより、13章の接続確認でホスト鍵確認プロンプトが出ることはなく、`~/.ssh/known_hosts`も一切変更されない。
 
 これらが指定されていないと、Ansibleは接続ユーザーや秘密鍵を特定できず、13章の接続確認が失敗する。
 
@@ -216,7 +219,7 @@ AnsibleからVMへ接続できるか確認する。
 cd ansible
 ```
 
-このリポジトリには`ansible.cfg`を用意していないため、初回接続時にSSHのホスト鍵確認プロンプト（`Are you sure you want to continue connecting (yes/no/[fingerprint])?`）が表示されることがある。その場合は`yes`と入力する。
+このリポジトリには`ansible.cfg`を用意していないが、12.4で説明したとおりInventory側の`ansible_ssh_common_args`（`[ubuntu:vars]`）がSSHのホスト鍵検証先を`terraform apply`時に生成された`ansible/known_hosts`にPinningしているため、初回接続時でもSSHのホスト鍵確認プロンプト（`Are you sure you want to continue connecting (yes/no/[fingerprint])?`）は表示されない。VMのホスト鍵と`ansible/known_hosts`の内容が一致しない場合は、確認プロンプトの代わりに`Host key verification failed`のようなエラーで接続が拒否される（19.3参照）。
 
 次に、
 
@@ -698,6 +701,20 @@ UNREACHABLE
 
 などになる。`UNREACHABLE`の場合は、Inventoryの接続情報（19.1）やSSH鍵のパス（002 4.2 / 004 12.4の`[ubuntu:vars]`）を疑う。
 
+## 19.3 ホスト鍵エラー（`Host key verification failed`）
+
+12.4 / 13章で説明したとおり、Ansibleは`ansible/known_hosts`（003 7.6参照）に登録されたSSHホスト公開鍵だけを信頼する。次のようなエラーが出た場合は、VMが提示しているホスト鍵と`ansible/known_hosts`の内容が一致していないことを意味する。
+
+```text
+fatal: [ubuntu1]: UNREACHABLE! => {"changed": false, "msg": "Failed to connect to the host via ssh: Host key verification failed."}
+```
+
+主な原因と対処は次のとおりである。
+
+- **VMを`terraform apply -replace`などで作り直した直後**: `multipass_file_download.host_key`が新しいホスト鍵を再ダウンロードし、`ansible/known_hosts`も再生成されるはずなので、再度`terraform apply`を実行して`ansible/known_hosts`が更新されているか確認する（`cat ansible/known_hosts`）。
+- **`terraform/.host_keys/*.pub`を手動で削除・変更した**: 003 10.5の手順（`terraform apply -replace='multipass_file_download.host_key["<VM名>"]'`）で再ダウンロードする。
+- **VMが停止中に`terraform plan` / `destroy`を実行してエラーになっていた**: 003 10.4を参照し、`multipass start`してから`terraform apply`をやり直す。
+
 ---
 
 # 20. 「どこが悪いのか」を切り分ける
@@ -778,9 +795,11 @@ ansible ... -m ansible.builtin.ping
 | VMには入れるがcloud-initが終わらない | `cloud-init status` / ログ（003 10.2） |
 | SSHできない | IP・SSH鍵・ユーザー（003 9.6） |
 | SSHできるがAnsible ping失敗 | Inventory・Ansible設定（19章） |
+| `Host key verification failed`になる | `ansible/known_hosts`とVMのホスト鍵の不一致（19.3） |
 | Ansible pingは成功するがPlaybook失敗 | Playbook・Module |
 | Shellが実行できない | Shellの内容・権限・改行コード |
 | VMが中途半端な状態で残っている | `multipass delete --purge` → `terraform apply`（003 10.3） |
+| VM停止中に`terraform plan` / `destroy`が失敗する | `multipass start`または`-refresh=false`（003 10.4） |
 
 ---
 

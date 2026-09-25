@@ -70,7 +70,7 @@
 - **問題点**: `ssh ubuntu@<VMのIPアドレス>`となっていたが、cloud-init（003 8.2）で作成される接続用ユーザーは`ubuntu`ではなく`ansible`であり、また秘密鍵（4.2で作成した`~/.ssh/ansible/id_ed25519`）を明示しないとデフォルト鍵で接続を試みてしまう。
 - **対応方針**: `ssh -i ~/.ssh/ansible/id_ed25519 ansible@<VMのIPアドレス>`に修正した。31章の切り分けフロー図中の`ssh ubuntu@IP`は概念図の略記のため未変更。
 
-### 10. ansible.cfgへの言及がない
+### 10. ansible.cfgへの言及がない【対応済み】
 - **該当**: 004 14, 17, 27章（`ansible-playbook`/`ansible`コマンド実行例）
 - **問題点**: リポジトリには`ansible.cfg`が存在せず、`ansible_ssh_private_key_file`をinventory側でしか指定していない。SSH初回接続時のホスト鍵確認プロンプト（`StrictHostKeyChecking`）について触れていないため、ワークショップ中に想定外のプロンプトが出る可能性がある。
-- **対応方針**: `ansible.cfg`の要否、またはSSHホスト鍵確認プロンプトへの対処について一言触れる。
+- **対応方針**: `ansible.cfg`は導入せず、代わりにTerraform側でSSHホスト鍵をPinningする方式を採った（`documents/ssh-host-key-pinning-design.md`）。`multipass_file_download`でVMのSSHホスト公開鍵をmultipassd経由（SSHを介さない）で取得し、`ansible/known_hosts`を生成、Inventoryの`[ubuntu:vars]`に`ansible_ssh_common_args`（`StrictHostKeyChecking=yes` + `UserKnownHostsFile`）を追加した。これにより初回接続時の`yes/no`プロンプト自体が発生しなくなるため、プロンプトへの対処ではなく発生条件そのものを取り除いている。004 12.4・13章に反映済み。

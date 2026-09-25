@@ -46,18 +46,23 @@ flowchart LR
 .
 ├── ansible/                    # Ansible Playbook・Inventory・スクリプト類
 │   ├── inventory.ini           # 接続先定義（terraform apply時に自動生成）
+│   ├── known_hosts             # SSHホスト鍵の許可リスト（terraform apply時に自動生成）
 │   ├── run_script.yml          # script moduleでMac上のShellをVMへ転送・実行するPlaybook
 │   ├── run_template.yml        # template moduleでVMごとに変数を出し分けるPlaybookのサンプル
 │   ├── scripts/                # MacからVMへ転送して実行するShellスクリプト
 │   └── templates/              # VMへ配置するテンプレートファイル
 ├── terraform/                  # Multipass VMを作成するTerraform設定
-│   ├── main.tf                 # VM作成・Inventory生成のリソース定義
+│   ├── main.tf                 # VM作成・SSHホスト鍵Pinning・Inventory生成のリソース定義
 │   ├── variables.tf            # 変数定義
 │   ├── terraform.tfvars.example  # tfvarsのひな形
-│   └── inventory.ini.tpl       # Ansible inventory生成用テンプレート
+│   ├── inventory.ini.tpl       # Ansible inventory生成用テンプレート
+│   ├── tests/                  # terraform testによる自動テスト
+│   └── .host_keys/             # 各VMのSSHホスト公開鍵（terraform apply時に自動生成）
 └── documents/
     └── workshop_materials/     # 本ワークショップのテキスト（後述）
 ```
+
+`ansible/inventory.ini`・`ansible/known_hosts`・`terraform/.host_keys/`はいずれも`terraform apply`時に自動生成されるファイルであり、Gitの管理対象外（`.gitignore`）である。SSHホスト鍵をどのようにTerraformが取得・Pinningしているかは[documents/workshop_materials/003_terraform_ansible_workshop.md「7.6 SSHホスト鍵のPinning」](documents/workshop_materials/003_terraform_ansible_workshop.md)を参照。
 
 各ファイルの詳細な役割は [documents/workshop_materials/003_terraform_ansible_workshop.md](documents/workshop_materials/003_terraform_ansible_workshop.md) の「6.1 ディレクトリ構成」にまとめられています。
 
@@ -83,4 +88,4 @@ flowchart LR
 
 ## 補足資料
 
-`documents/` 配下には、上記の学習テキストのほかに、実装上の設計判断を記録した内部向けドキュメント（例: [cloud-init-ssh-key-yaml-safety-design.md](documents/cloud-init-ssh-key-yaml-safety-design.md)）も含まれています。ワークショップの学習コンテンツ本体ではないため、興味があれば参考程度にご覧ください。
+`documents/` 配下には、上記の学習テキストのほかに、実装上の設計判断を記録した内部向けドキュメント（例: [cloud-init-ssh-key-yaml-safety-design.md](documents/cloud-init-ssh-key-yaml-safety-design.md)、[ssh-host-key-pinning-design.md](documents/ssh-host-key-pinning-design.md)）も含まれています。ワークショップの学習コンテンツ本体ではないため、興味があれば参考程度にご覧ください。
