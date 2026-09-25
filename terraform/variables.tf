@@ -43,3 +43,9 @@ variable "ansible_inventory_path" {
   type        = string
   default     = "../ansible/inventory.ini"
 }
+
+variable "ansible_known_hosts_path" {
+  description = "Output path for the generated SSH known_hosts file used by Ansible"
+  type        = string
+  default     = "../ansible/known_hosts"
+}
