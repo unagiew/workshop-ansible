@@ -356,12 +356,27 @@ flowchart TD
 
 ```hcl
 variable "nodes" {
-  description = "Worker node Lima VM settings"
+  description = "Worker node multipass VM settings"
   type = map(object({
     cpus   = number
     memory = string
     disk   = string
   }))
+
+  validation {
+    condition     = alltrue([for n in values(var.nodes) : n.cpus > 0])
+    error_message = "Each node's cpus must be greater than 0."
+  }
+
+  validation {
+    condition     = alltrue([for n in values(var.nodes) : can(regex("^[0-9]+[MG]$", n.memory))])
+    error_message = "Each node's memory must match the pattern <number><M|G>, e.g. \"4G\"."
+  }
+
+  validation {
+    condition     = alltrue([for n in values(var.nodes) : can(regex("^[0-9]+[MG]$", n.disk))])
+    error_message = "Each node's disk must match the pattern <number><M|G>, e.g. \"20G\"."
+  }
 }
 
 variable "ssh_public_key_path" {
@@ -401,6 +416,8 @@ variable "ansible_known_hosts_path" {
 | `vm_image` | 使用するMultipassイメージ | `24.04` |
 | `ansible_inventory_path` | 生成するinventoryファイルの出力先 | `../ansible/inventory.ini` |
 | `ansible_known_hosts_path` | 生成するknown_hostsファイルの出力先（7.6参照） | `../ansible/known_hosts` |
+
+`nodes`には`validation`ブロックを定義しており、`cpus`が0以下の場合や、`memory`・`disk`が`<数値><M|G>`（例: `4G`、`20G`）の形式でない場合は、`terraform plan`/`apply`の時点でエラーになる。
 
 ## 7.4 terraform.tfvars
 

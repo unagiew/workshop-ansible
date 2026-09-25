@@ -24,7 +24,7 @@ locals {
   # after the base64 field (the free-form comment) is intentionally ignored.
   ssh_public_key_regex = "^(ssh-[a-z0-9-]+|ecdsa-sha2-[a-z0-9-]+|sk-[a-z0-9-]+@openssh\\.com) +([A-Za-z0-9+/=]+)"
 
-  # try() avoids a hard crash here so the check block below can report a
+  # try() avoids a hard crash here so the precondition below can report a
   # clear, actionable error instead of a raw regex failure.
   ssh_public_key_match = try(regex(local.ssh_public_key_regex, local.ssh_public_key_raw), null)
 
