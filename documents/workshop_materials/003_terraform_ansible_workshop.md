@@ -16,7 +16,6 @@
 │   └── templates
 │       └── motd.j2
 └── terraform
-    ├── cloud-init.yaml.tftpl
     ├── inventory.ini.tpl
     ├── main.tf
     ├── terraform.tfvars
@@ -32,7 +31,6 @@
 | `terraform/variables.tf` | Terraformの変数定義 |
 | `terraform/terraform.tfvars` | 環境固有の変数値（VM構成やSSH鍵パスなど） |
 | `terraform/terraform.tfvars.example` | `terraform.tfvars`作成時のひな形 |
-| `terraform/cloud-init.yaml.tftpl` | VM初期設定テンプレート |
 | `terraform/inventory.ini.tpl` | Ansible inventory生成用テンプレート |
 | `ansible/inventory.ini` | Ansibleの接続先（`terraform apply`時に自動生成） |
 | `ansible/run_script.yml` | Ansibleの処理内容（15章） |
@@ -93,9 +91,54 @@ terraform {
 }
 
 locals {
-  ssh_public_key = trimspace(
+  ssh_public_key_raw = trimspace(
     file(pathexpand(var.ssh_public_key_path))
   )
+
+  # Matches "<type> <base64>" at the start of an OpenSSH public key line,
+  # covering the standard key types plus FIDO2/U2F "sk-" variants. Anything
+  # after the base64 field (the free-form comment) is intentionally ignored.
+  ssh_public_key_regex = "^(ssh-[a-z0-9-]+|ecdsa-sha2-[a-z0-9-]+|sk-[a-z0-9-]+@openssh\\.com) +([A-Za-z0-9+/=]+)"
+
+  # try() avoids a hard crash here so the precondition below can report a
+  # clear, actionable error instead of a raw regex failure.
+  ssh_public_key_match = try(regex(local.ssh_public_key_regex, local.ssh_public_key_raw), null)
+
+  # Reconstruct the key as "<type> <base64>" only, dropping the comment.
+  # OpenSSH ignores the comment for authentication, and it is the primary
+  # source of unpredictable, user-edited content, so it is intentionally not
+  # carried into the rendered cloud-init document. yamlencode() below would
+  # already safely escape any comment content, but stripping it removes the
+  # highest-risk portion of the string as defense in depth.
+  ssh_public_key = local.ssh_public_key_match == null ? "" : "${local.ssh_public_key_match[0]} ${local.ssh_public_key_match[1]}"
+
+  # Cloud-init document for each node, built as an HCL structure so that
+  # yamlencode() produces well-formed YAML regardless of the content of
+  # ssh_public_key. This replaces the former cloud-init.yaml.tftpl.
+  cloud_init_config = {
+    users = [
+      "default",
+      {
+        name        = "ansible"
+        gecos       = "Ansible user"
+        shell       = "/bin/bash"
+        groups      = ["sudo"]
+        sudo        = ["ALL=(ALL) NOPASSWD:ALL"]
+        lock_passwd = true
+        ssh_authorized_keys = [
+          local.ssh_public_key
+        ]
+      }
+    ]
+
+    ssh_pwauth   = false
+    disable_root = true
+
+    packages = [
+      "python3",
+      "python3-apt"
+    ]
+  }
 }
 
 resource "multipass_instance" "node" {
@@ -107,12 +150,23 @@ resource "multipass_instance" "node" {
   memory = each.value.memory
   disk   = each.value.disk
 
-  cloud_init = templatefile(
-    "${path.module}/cloud-init.yaml.tftpl",
-    {
-      ssh_public_key = local.ssh_public_key
+  # #cloud-config is prepended literally since yamlencode() only emits the
+  # YAML body, not the leading marker cloud-init requires.
+  cloud_init = "#cloud-config\n${yamlencode(local.cloud_init_config)}"
+
+  lifecycle {
+    precondition {
+      # Validates that the file at var.ssh_public_key_path actually contains
+      # an OpenSSH public key, since yamlencode() only guarantees
+      # syntactically valid YAML, not syntactically valid key content (e.g. a
+      # typo'd path pointing at a private key or an empty file). A lifecycle
+      # precondition hard-fails plan/apply, which is required here since a
+      # passing apply with an empty ssh_authorized_keys entry would silently
+      # create an unreachable VM.
+      condition     = local.ssh_public_key_match != null
+      error_message = "The SSH public key at var.ssh_public_key_path (\"${var.ssh_public_key_path}\") does not look like a valid OpenSSH public key. Expected format: \"<type> <base64> [comment]\", e.g. \"ssh-ed25519 AAAA... user@host\". Check that the path points at a public key file (not a private key) and that it is not empty or corrupted."
     }
-  )
+  }
 }
 
 resource "local_file" "ansible_inventory" {
@@ -154,7 +208,13 @@ main.tfの各ブロックの役割は次のとおりである。
 
 ### `locals`ブロック
 
-`var.ssh_public_key_path`（7.3参照）が指すファイルを読み込み、前後の空白・改行を`trimspace`で取り除いたものを`local.ssh_public_key`として定義する。以降のcloud-init設定（`multipass_instance.node`）で、この値をSSH公開鍵の文字列として使用する。
+`var.ssh_public_key_path`（7.3参照）が指すファイルを読み込み、前後の空白・改行を`trimspace`で取り除いたものを`local.ssh_public_key_raw`として定義する。
+
+`local.ssh_public_key_raw`は、正規表現`local.ssh_public_key_regex`（`"<鍵種別> <base64>"`という先頭部分にマッチ）で`local.ssh_public_key_match`として解析される。マッチした場合は`<鍵種別>`と`<base64>`のみを組み立て直したものを`local.ssh_public_key`とし、末尾のコメント（`user@host`のような自由記述部分）はあえて除去する。これはOpenSSHの認証にコメントが不要である一方、コメントは内容が予測できない（YAMLで特別な意味を持つ文字を含みうる）ため、リスクの高い部分を先に取り除いておく多重の安全対策である。
+
+`local.ssh_public_key_match`が`null`（＝正規表現にマッチしない＝OpenSSHの公開鍵として不正な内容）の場合は、`local.ssh_public_key`は空文字列になる。この状態のまま`terraform apply`が進んでしまわないよう、`multipass_instance.node`（後述）に`precondition`によるチェックが用意されている。
+
+`local.cloud_init_config`は、cloud-initに渡す設定内容をYAMLの文字列としてではなく、HCLのマップ（オブジェクト）として定義したものである。中身は8.2で説明するcloud-init.yamlと同じ構造（`users` / `ssh_pwauth` / `disable_root` / `packages`）を持つ。
 
 ### `resource "multipass_instance" "node"`
 
@@ -179,7 +239,8 @@ VM本体を作成するリソースである。
   | `each.key` | `ubuntu1`などのVM名 |
   | `each.value` | CPU、メモリ、ディスクなどの設定 |
 - `image` / `cpus` / `memory` / `disk` は、それぞれ`var.vm_image`と`each.value`の各項目をVM作成時のスペックとして渡す。
-- `cloud_init` は、`cloud-init.yaml.tftpl`（8.2）をテンプレートとして読み込み、`ssh_public_key`に`local.ssh_public_key`を埋め込んだ内容をVMの初期設定として渡す。
+- `cloud_init` は、`local.cloud_init_config`（HCLのマップ）を`yamlencode()`関数でYAML文字列に変換し、先頭に`#cloud-config`というマーカーを付与した内容をVMの初期設定として渡す（詳細は8.2）。`yamlencode()`を使うことで、`local.ssh_public_key`にYAMLの特殊文字（コロンや`*`、`&`など）が含まれていた場合でも、常に構文的に正しいYAMLが生成される。
+- `lifecycle`ブロックの`precondition`は、`local.ssh_public_key_match`が`null`（＝`var.ssh_public_key_path`の内容がOpenSSHの公開鍵として不正）の場合に、`terraform plan` / `apply`をエラーで停止させる。これにより、SSH公開鍵が正しく読み込めていない状態のままVMが作成され、Ansibleから接続できない状態になることを防ぐ。
 
 ### `resource "local_file" "ansible_inventory"`
 
@@ -346,34 +407,71 @@ flowchart TD
 
 この流れを踏まえないと、VMは作成できてもAnsibleから操作できない状態になってしまう。
 
-## 8.2 cloud-init.yaml
+## 8.2 cloud-initの生成方法
+
+cloud-initに渡す設定内容は、`cloud-init.yaml`のような静的なYAMLテンプレートファイルとしては用意されていない。代わりに、main.tf（7.2）の`locals.cloud_init_config`でHCLのマップとして定義し、`yamlencode()`関数でYAML文字列に変換する、という方法で生成している。
+
+```hcl
+cloud_init = "#cloud-config\n${yamlencode(local.cloud_init_config)}"
+```
+
+`local.cloud_init_config`（main.tf、7.2参照）の内容は、次のとおりである。
+
+```hcl
+cloud_init_config = {
+  users = [
+    "default",
+    {
+      name        = "ansible"
+      gecos       = "Ansible user"
+      shell       = "/bin/bash"
+      groups      = ["sudo"]
+      sudo        = ["ALL=(ALL) NOPASSWD:ALL"]
+      lock_passwd = true
+      ssh_authorized_keys = [
+        local.ssh_public_key
+      ]
+    }
+  ]
+
+  ssh_pwauth   = false
+  disable_root = true
+
+  packages = [
+    "python3",
+    "python3-apt"
+  ]
+}
+```
+
+`yamlencode()`はこのマップを受け取り、次のようなYAMLを生成する（`local.ssh_public_key`の実際の値が展開された状態）。`#cloud-config`はcloud-initが要求する先頭マーカーであり、`yamlencode()`はYAML本体しか生成しないため、main.tf側で文字列結合により手動で付与している。
 
 ```yaml
 #cloud-config
-
-users:
-  - default
-
-  - name: ansible
-    gecos: Ansible user
-    shell: /bin/bash
-    groups:
-      - sudo
-    sudo:
-      - ALL=(ALL) NOPASSWD:ALL
-    lock_passwd: true
-    ssh_authorized_keys:
-      - ${ssh_public_key}
-
-ssh_pwauth: false
 disable_root: true
-
 packages:
   - python3
   - python3-apt
+ssh_pwauth: false
+users:
+  - default
+  - gecos: Ansible user
+    groups:
+      - sudo
+    lock_passwd: true
+    name: ansible
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAA...
+    sudo:
+      - ALL=(ALL) NOPASSWD:ALL
 ```
 
-`${ssh_public_key}`の部分は、手動で書き換える必要はない。main.tf（7.2）が`templatefile()`関数でこのテンプレートを読み込む際に、`terraform.tfvars`の`ssh_public_key_path`（7.4）で指定したSSH公開鍵の内容を自動的に埋め込む。
+内容（ユーザー作成、SSH公開鍵登録、パッケージインストールなどの設定項目）自体は、以前の`cloud-init.yaml.tftpl`テンプレートと変わらない。変わったのは、その内容を**手書きのYAMLテンプレート**として用意するか、**HCLのデータ構造**として定義し`yamlencode()`で変換するか、という生成方法の部分である。
+
+この方式に変更した理由は、YAMLとしての安全性を保証するためである。手書きのYAMLテンプレートに`${ssh_public_key}`のような形で値を文字列展開する場合、その値（今回であればSSH公開鍵）にコロン（`:`）や`*`、`&`、`!`など、YAMLで特別な意味を持つ文字が含まれていると、生成されるYAML自体が壊れてしまう可能性がある。特にSSH公開鍵の末尾のコメント（`user@host`など）は利用者が自由に書き換えられる部分であり、内容を予測できない。
+
+`yamlencode()`はHCLの値（文字列・リスト・マップなど）を受け取り、必要に応じてエスケープやクォートを行いながら、常に構文的に正しいYAMLを生成する関数である。そのため、`local.ssh_public_key`にどのような文字列が入っていても、生成されるcloud-initのYAMLが壊れることはない。なお、SSH公開鍵のコメント部分は7.2で説明したとおり`local.ssh_public_key`の生成時点で除去されており、この点でも多重に安全性が確保されている。
 
 # 9. VM構築の実行
 
