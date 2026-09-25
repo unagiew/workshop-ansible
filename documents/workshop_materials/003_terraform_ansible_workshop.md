@@ -660,7 +660,7 @@ following symbols:
 Terraform will perform the following actions:
 (略)
 
-$ terraform apply  # 計画を実行（VM作成）
+$ terraform apply -parallelism=1  # 計画を実行（VM作成、1台ずつ）
 
 Terraform used the selected providers to generate the following execution plan. Resource actions are indicated with the
 following symbols:
@@ -674,11 +674,12 @@ Do you want to perform these actions?
 
   Enter a value:   # "yes"を入力
 
-multipass_instance.node["ubuntu2"]: Creating...
 multipass_instance.node["ubuntu1"]: Creating...
 (略、cloud-initの完了待ちのため数十秒かかる)
-multipass_instance.node["ubuntu2"]: Creation complete after 46s [id=ubuntu2]
 multipass_instance.node["ubuntu1"]: Creation complete after 47s [id=ubuntu1]
+multipass_instance.node["ubuntu2"]: Creating...
+(略)
+multipass_instance.node["ubuntu2"]: Creation complete after 46s [id=ubuntu2]
 multipass_file_download.host_key["ubuntu1"]: Creating...
 multipass_file_download.host_key["ubuntu2"]: Creating...
 multipass_file_download.host_key["ubuntu1"]: Creation complete after 1s
@@ -707,6 +708,14 @@ nodes = {
     "state" = "Running"
   }
 }
+```
+
+`terraform apply`には`-parallelism=1`を付けることを推奨する。Terraformは既定で最大10個のリソースを並列に作成するため、複数のVMがほぼ同時に起動する。macOSでは、MultipassのVMに対するDHCPをmacOS標準のDHCPサーバー（bootpd）が担当しており、同時に届いたDHCP要求に対して**複数のVMへ同じIPアドレスを割り当ててしまう**ことがある。`-parallelism=1`でVMを1台ずつ作成すればこの問題は起きない（VMの台数分だけ作成時間は長くなる）。詳細と確認方法は10.6を参照。
+
+毎回オプションを付けるのが手間であれば、環境変数で`terraform apply`の既定オプションとして設定しておくこともできる。
+
+```bash
+export TF_CLI_ARGS_apply="-parallelism=1"
 ```
 
 ## 9.3 Multipassの状態確認
@@ -922,6 +931,23 @@ Error: Attempt to index null value
 
 ```bash
 terraform apply -replace='multipass_file_download.host_key["ubuntu1"]'
+```
+
+## 10.6 複数のVMに同じIPアドレスが割り当てられる（macOS）
+
+`-parallelism=1`を付けずに`terraform apply`を実行すると、macOSでは複数のVMに同じIPアドレスが割り当てられることがある。この状態では、Ansibleが意図しないVMに接続しようとするため、7.6のPinningにより`Host key verification failed`で接続が拒否される（誤ったVMをそのまま操作することはない）。
+
+同じIPアドレスが実際にVMへ割り当てられているかは、VMの中から確認できる。
+
+```bash
+multipass exec ubuntu1 -- ip -4 -br addr show
+multipass exec ubuntu2 -- ip -4 -br addr show
+```
+
+VM内でも同じIPアドレスになっている場合は、macOSのDHCPサーバー（bootpd）が同時に届いたDHCP要求に同じIPアドレスを割り当てたことが原因と考えられる。Ubuntu側はIPアドレスの重複を検知しないため、両方のVMがそのIPアドレスを使い続けてしまう。重複したVMを作り直し、以降は`-parallelism=1`（9.2参照）を付けて実行する。
+
+```bash
+terraform apply -parallelism=1 -replace='multipass_instance.node["ubuntu2"]'
 ```
 
 ---

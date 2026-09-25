@@ -800,6 +800,7 @@ ansible ... -m ansible.builtin.ping
 | Shellが実行できない | Shellの内容・権限・改行コード |
 | VMが中途半端な状態で残っている | `multipass delete --purge` → `terraform apply`（003 10.3） |
 | VM停止中に`terraform plan` / `destroy`が失敗する | `multipass start`または`-refresh=false`（003 10.4） |
+| 複数のVMに同じIPアドレスが割り当てられる（macOS） | 該当VMを作り直し、`terraform apply -parallelism=1`（003 10.6） |
 
 ---
 
